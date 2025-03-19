@@ -46,9 +46,10 @@ Gamepad::Gamepad(const string &path)
     close(fd);
     throw runtime_error("Failed to initialize libevdev");
   }
-  buttons.push_back(false);
-  triggers.push_back(0.0f);
-  axes.push_back(0.0f);
+
+  buttons.resize(BTN_THUMBR - BTN_A + 1, false);
+  axes.resize(ABS_RY - ABS_X + 1, 0.0f);
+  triggers.resize(ABS_RZ - ABS_Z + 1, 0.0f);
 
   evdev = unique_ptr<libevdev, void (*)(libevdev *)>(
       dev, [](libevdev *dev) { libevdev_free(dev); });
@@ -63,7 +64,7 @@ void Gamepad::updateState() {
     switch (ev.type) {
     case EV_KEY:
       if (ev.code >= BTN_A && ev.code <= BTN_THUMBR) {
-        cout << "button input" << endl;
+        /*cout << "button input" << endl;*/
         buttons[ev.code - BTN_A] = ev.value != 0;
       }
       break;
@@ -78,7 +79,7 @@ void Gamepad::updateState() {
         int minValue = libevdev_get_abs_minimum(evdev.get(), ev.code);
         if (maxValue > minValue) {
           float range = static_cast<float>(maxValue - minValue);
-          cout << "axis movement" << endl;
+          /*cout << "axis movement" << endl;*/
           axes[ev.code - ABS_X] = (ev.value - minValue) / range * 2.0f - 1.0f;
         } else {
           axes[ev.code - ABS_X] = 0.0f;
@@ -89,7 +90,7 @@ void Gamepad::updateState() {
       case ABS_Z:
       case ABS_RZ: {
         int maxValue = libevdev_get_abs_maximum(evdev.get(), ev.code);
-        cout << "trigger input" << endl;
+        /*cout << "trigger input" << endl;*/
         triggers[ev.code - ABS_Z] =
             maxValue > 0 ? ev.value / static_cast<float>(maxValue) : 0.0f;
       } break;
@@ -111,8 +112,9 @@ bool Gamepad::isAnyButtonPressed() const {
 }
 
 bool Gamepad::isAxisMoved() const {
+  const float threshold = 0.1f;
   for (float axis : axes) {
-    if (axis) {
+    if (axis > threshold) {
       return true;
     }
   }
@@ -120,7 +122,7 @@ bool Gamepad::isAxisMoved() const {
 }
 
 bool Gamepad::isAnyTriggerPressed() const {
-  const float threshold = 0.0f;
+  const float threshold = 0.1f;
   for (float trigger : triggers) {
     if (trigger > threshold) {
       return true;
@@ -151,40 +153,44 @@ int main() {
 
     Gamepad gamepad(deviceEventFile);
 
+    bool isActive = false;
+    bool firstIter = true; /* added to remove unexpected behaviour for first
+    interation of while loop incase of inactive state */
+
     auto lastActiveTime = chrono::steady_clock::now();
 
     while (true) {
-      bool active = false;
-      gamepad.updateState();
-
-      bool anyButtonPressed = gamepad.isAnyButtonPressed();
-      if (anyButtonPressed) {
-        active = true;
-        lastActiveTime = chrono::steady_clock::now();
-      }
-      if (!active) {
-        bool axisMoved = gamepad.isAxisMoved();
-        if (axisMoved) {
-          active = true;
-          lastActiveTime = chrono::steady_clock::now();
-        }
-      }
-      if (!active) {
-        bool triggerPress = gamepad.isAnyTriggerPressed();
-        if (triggerPress) {
-          active = true;
-          lastActiveTime = chrono::steady_clock::now();
-        }
-      }
 
       auto currentTime = chrono::steady_clock::now();
-      auto inactiveDuration =
-          chrono::duration_cast<chrono::seconds>(currentTime - lastActiveTime);
-      if (inactiveDuration.count() >= 10) {
-        cout << "Inactive controller" << endl;
+      gamepad.updateState();
+
+      bool anyButtonPress = gamepad.isAnyButtonPressed();
+      bool axisMove = gamepad.isAxisMoved();
+      bool triggerPress = gamepad.isAnyTriggerPressed();
+
+      if (anyButtonPress || axisMove || triggerPress) {
+        if (!isActive) {
+          cout << "controller is active" << endl;
+          isActive = true;
+          firstIter = false;
+        }
+        lastActiveTime = currentTime;
       }
 
-      this_thread::sleep_for(chrono::milliseconds(THRESHOLD));
+      auto inactiveDuration =
+          chrono::duration_cast<chrono::seconds>(currentTime - lastActiveTime);
+
+      if (inactiveDuration.count() >= THRESHOLD) {
+        if (isActive) {
+          cout << "controller is inactive" << endl;
+          isActive = false;
+        } else if (firstIter) {
+          cout << "controller is inactive" << endl;
+          firstIter = false;
+        }
+      }
+
+      this_thread::sleep_for(chrono::milliseconds(10));
     }
   } catch (const exception &e) {
     cerr << "Error: " << e.what() << endl;
