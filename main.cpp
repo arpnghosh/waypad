@@ -1,5 +1,7 @@
+#include "include/idle-inhibit-unstable-v1-client-protocol.h"
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <iostream>
@@ -12,10 +14,20 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <wayland-client-core.h>
+#include <wayland-client-protocol.h>
 
 using namespace std;
 
 #define THRESHOLD 10
+
+struct wlContext {
+  struct wl_display *display = nullptr;
+  struct wl_compositor *compositor = nullptr;
+  struct wl_surface *surface = nullptr;
+  struct zwp_idle_inhibit_manager_v1 *idle_inhibit_manager = nullptr;
+  struct zwp_idle_inhibitor_v1 *idle_inhibitor = nullptr;
+};
 
 class Gamepad {
 public:
@@ -143,7 +155,73 @@ filesystem::path findDevice(const filesystem::path &inputDeviceFolder) {
   return filesystem::path();
 }
 
+static void registry_handle_global(void *data, struct wl_registry *registry,
+                                   uint32_t name, const char *interface,
+                                   uint32_t version) {
+  wlContext *context = static_cast<wlContext *>(data);
+  if (strcmp(interface, wl_compositor_interface.name) == 0) {
+    context->compositor = static_cast<wl_compositor *>(
+        wl_registry_bind(registry, name, &wl_compositor_interface, version));
+  } else if (strcmp(interface, zwp_idle_inhibit_manager_v1_interface.name) ==
+             0) {
+    context->idle_inhibit_manager =
+        static_cast<zwp_idle_inhibit_manager_v1 *>(wl_registry_bind(
+            registry, name, &zwp_idle_inhibit_manager_v1_interface, version));
+  }
+}
+
+static const struct wl_registry_listener registryListener = {
+    .global = registry_handle_global,
+    .global_remove = [](void *, struct wl_registry *, uint32_t) {}};
+;
+
+bool connectToWayland(wlContext &context) {
+
+  context.display = wl_display_connect(nullptr);
+  if (!context.display) {
+    cerr << "Failed to connect to wayland display " << endl;
+    return false;
+  }
+
+  struct wl_registry *registry = wl_display_get_registry(context.display);
+  if (!registry) {
+    cerr << "Failed to get wayland registry" << endl;
+    wl_display_disconnect(context.display);
+    return false;
+  }
+
+  wl_registry_add_listener(registry, &registryListener, &context);
+  wl_display_roundtrip(context.display);
+
+  if (!context.compositor || !context.idle_inhibit_manager) {
+    cerr << "Required Wayland globals not available" << endl;
+    wl_display_disconnect(context.display);
+    return false;
+  }
+
+  context.surface = wl_compositor_create_surface(context.compositor);
+  if (!context.surface) {
+    cerr << "Failed to create Wayland surface" << endl;
+    wl_display_disconnect(context.display);
+    return false;
+  }
+  wl_surface_commit(context.surface);
+
+  return true;
+}
+
+void clean(wlContext &context) {
+  zwp_idle_inhibitor_v1_destroy(context.idle_inhibitor);
+  wl_surface_destroy(context.surface);
+  wl_display_disconnect(context.display);
+}
+
 int main() {
+  wlContext context;
+  if (!connectToWayland(context)) {
+    return EXIT_FAILURE;
+  }
+
   try {
     filesystem::path deviceEventFile = findDevice("/dev/input/by-id/");
     if (deviceEventFile.empty()) {
@@ -154,12 +232,22 @@ int main() {
     Gamepad gamepad(deviceEventFile);
 
     bool isActive = false;
-    bool firstIter = true; /* added to remove unexpected behaviour for first
-    interation of while loop incase of inactive state */
+    bool firstIter = true;
 
     auto lastActiveTime = chrono::steady_clock::now();
 
     while (true) {
+      while (wl_display_prepare_read(context.display) != 0) {
+        wl_display_dispatch_pending(context.display);
+      }
+      wl_display_flush(context.display);
+
+      if (wl_display_read_events(context.display) == -1) {
+        cerr << "Failed to read Wayland events" << endl;
+        break;
+      }
+
+      wl_display_dispatch_pending(context.display);
 
       auto currentTime = chrono::steady_clock::now();
       gamepad.updateState();
@@ -173,6 +261,14 @@ int main() {
           cout << "controller is active" << endl;
           isActive = true;
           firstIter = false;
+
+          if (!context.idle_inhibitor) {
+            context.idle_inhibitor =
+                zwp_idle_inhibit_manager_v1_create_inhibitor(
+                    context.idle_inhibit_manager, context.surface);
+            wl_surface_commit(context.surface);
+            cout << "Idle inhibitor created successfully" << endl;
+          }
         }
         lastActiveTime = currentTime;
       }
@@ -184,6 +280,12 @@ int main() {
         if (isActive) {
           cout << "controller is inactive" << endl;
           isActive = false;
+          if (context.idle_inhibitor) {
+            zwp_idle_inhibitor_v1_destroy(context.idle_inhibitor);
+            wl_surface_commit(context.surface);
+            context.idle_inhibitor = 0;
+            cout << "Idle inhibitor destroyed successfully" << endl;
+          }
         } else if (firstIter) {
           cout << "controller is inactive" << endl;
           firstIter = false;
@@ -196,5 +298,8 @@ int main() {
     cerr << "Error: " << e.what() << endl;
     return EXIT_FAILURE;
   }
+
+  clean(context);
+
   return 0;
 }
